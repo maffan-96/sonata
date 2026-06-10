@@ -65,6 +65,20 @@ This repo provide two ways of installation: **standalone mode** and **package mo
   python demo/2_sem_seg.py  # linear probed head on ScanNet
   ```
 
+- **PCA-visualize your own point cloud (and save the result).** `demo/5_custom_pca.py`
+  runs the Sonata encoder on any point cloud file and colors each point by a PCA
+  projection of its features (unsupervised — works on indoor *or* outdoor data
+  since it needs no classification head):
+  ```bash
+  export PYTHONPATH=./
+  python demo/5_custom_pca.py \
+      --input  /path/to/your_scene.ply \
+      --output /path/to/your_scene_pca.ply
+  ```
+  Same input formats as below; writes `<output>.ply` (PCA-colored) and a
+  `<output>.npz` with `coord`/`color`. Use `--brightness` to tune color
+  intensity and `--grid-size` for voxel downsampling.
+
 - **Segment your own point cloud (and save the result).** `demo/4_custom_sem_seg.py`
   runs the same ScanNet-20 linear-probed head on any point cloud file you pass
   in and writes the segmented cloud to disk:
