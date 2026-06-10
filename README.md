@@ -65,6 +65,41 @@ This repo provide two ways of installation: **standalone mode** and **package mo
   python demo/2_sem_seg.py  # linear probed head on ScanNet
   ```
 
+- **PCA-visualize your own point cloud (and save the result).** `demo/5_custom_pca.py`
+  runs the Sonata encoder on any point cloud file and colors each point by a PCA
+  projection of its features (unsupervised — works on indoor *or* outdoor data
+  since it needs no classification head):
+  ```bash
+  export PYTHONPATH=./
+  python demo/5_custom_pca.py \
+      --input  /path/to/your_scene.ply \
+      --output /path/to/your_scene_pca.ply
+  ```
+  Same input formats as below; writes `<output>.ply` (PCA-colored) and a
+  `<output>.npz` with `coord`/`color`. Use `--brightness` to tune color
+  intensity and `--grid-size` for voxel downsampling.
+
+- **Segment your own point cloud (and save the result).** `demo/4_custom_sem_seg.py`
+  runs the same ScanNet-20 linear-probed head on any point cloud file you pass
+  in and writes the segmented cloud to disk:
+  ```bash
+  export PYTHONPATH=./
+  python demo/4_custom_sem_seg.py \
+      --input  /path/to/your_scene.ply \
+      --output /path/to/your_scene_seg.ply
+  ```
+  - `--input` accepts `.ply` / `.pcd` / `.xyz` / `.pts` (read via open3d) or
+    `.npz` / `.npy` containing a `coord` array (optionally `color` in 0-255 and
+    `normal`). Missing colors default to gray and missing normals are estimated
+    automatically.
+  - `--output` is optional (defaults to `<input>_seg.ply`). The script writes a
+    color-coded `<output>.ply` and a `<output>.npz` holding the per-point class
+    id (`segment`), class name (`label`), and the ScanNet label/color mapping.
+  - `--grid-size` (default `0.02` m) controls voxel downsampling; the prediction
+    is mapped back to **every** original point before saving.
+  - The released head predicts the 20 ScanNet classes (wall, floor, chair, …),
+    so it works best on indoor RGB scenes similar to ScanNet.
+
 <div align='left'>
 <img src="https://raw.githubusercontent.com/pointcept/assets/main/sonata/demo.png" alt="teaser" width="800" />
 </div>
