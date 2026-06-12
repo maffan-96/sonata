@@ -27,5 +27,5 @@ dependencies:
   - matplotlib  # for demo visualization
   - pip:
     - torch-scatter --find-links https://data.pyg.org/whl/torch-2.5.0+cu124.html
-    - git+https://github.com/Dao-AILab/flash-attention.git
+    - flash-attn --no-build-isolation
     - spconv-cu124
