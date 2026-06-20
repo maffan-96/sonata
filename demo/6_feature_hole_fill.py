@@ -367,6 +367,8 @@ def loop_is_fillable(loop, verts, feat, sigma_f, med_edge, args):
     # size band: skip micro-gaps (DC artifacts) and oversized openings
     if len(loop) < args.min_hole_edges or len(loop) > args.max_hole_edges:
         return False, None
+    if not np.isfinite(P).all():        # non-finite loop vertex -> never fill
+        return False, None
     diam = np.linalg.norm(P.max(0) - P.min(0))
     if diam > args.max_hole_diam_vox * med_edge:
         return False, None
@@ -390,6 +392,9 @@ def loop_is_fillable(loop, verts, feat, sigma_f, med_edge, args):
     u = u - n * (u @ n)
     u /= np.linalg.norm(u) + 1e-12
     v = np.cross(n, u)
+    if not (np.isfinite(c).all() and np.isfinite(n).all()
+            and np.isfinite(u).all() and np.isfinite(v).all()):
+        return False, None              # degenerate basis -> skip
     return True, (c, u, v, n)
 
 
@@ -695,11 +700,24 @@ def _run_fill(verts, faces, vnormal, feat, out_ply, args):
     else:
         out_verts, out_faces = verts, faces
 
+    # drop any face that touches a non-finite vertex (NaN/Inf either inherited
+    # from the input QEM mesh or produced by a degenerate fill); those vertices
+    # then become unreferenced and are removed. Prevents NaN face areas/
+    # probabilities downstream (e.g. area-weighted mesh samplers).
+    finite_v = np.isfinite(out_verts).all(axis=1)
+    n_bad = int((~finite_v).sum())
+    if n_bad:
+        good_face = finite_v[out_faces].all(axis=1)
+        print(f"  [clean] dropping {n_bad} non-finite vertices and "
+              f"{int((~good_face).sum())} faces referencing them")
+        out_faces = out_faces[good_face]
+
     out = o3d.geometry.TriangleMesh()
     out.vertices = o3d.utility.Vector3dVector(out_verts.astype(np.float64))
     out.triangles = o3d.utility.Vector3iVector(out_faces.astype(np.int32))
     out.remove_duplicated_vertices()
     out.remove_degenerate_triangles()
+    out.remove_unreferenced_vertices()
     out.compute_vertex_normals()
     o3d.io.write_triangle_mesh(out_ply, out)
     print(f"Saved completed mesh -> {out_ply}  "
