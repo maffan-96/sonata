@@ -72,7 +72,7 @@ except ImportError as e:  # pragma: no cover
 # --------------------------------------------------------------------------- #
 # Features
 # --------------------------------------------------------------------------- #
-def sonata_features(coord, color, normal, feat_dim, device=None):
+def sonata_features(coord, color, normal, feat_dim, grid_size=None, device=None):
     """Run the Sonata encoder on a point set and return per-point features
     reduced to `feat_dim` dims and L2-normalised. Imported lazily so the rest
     of the script (mesh logic) runs without the heavy sonata/spconv env."""
@@ -97,6 +97,10 @@ def sonata_features(coord, color, normal, feat_dim, device=None):
     model.eval()
 
     transform = sonata.transform.default()
+    if grid_size is not None:
+        for t in transform.transforms:
+            if type(t).__name__ == "GridSample":
+                t.grid_size = grid_size
     point = {
         "coord": coord.astype(np.float32),
         "color": color.astype(np.float32),   # 0-255
@@ -155,14 +159,16 @@ def attach_features(verts, vcolor, vnormal, args):
             dpcd.estimate_normals(
                 o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
             dnormal = np.asarray(dpcd.normals)
-        dfeat = sonata_features(dcoord, dcolor, dnormal, args.feat_dim)
+        dfeat = sonata_features(dcoord, dcolor, dnormal, args.feat_dim,
+                                grid_size=args.grid_size)
         print("  transferring dense features to mesh vertices (nearest neighbour)")
         _, idx = cKDTree(dcoord).query(verts, k=1)
         feat = dfeat[idx]
     else:
         print("  [warn] computing Sonata features on DECIMATED vertices; "
               "feature quality is better with --dense <dense_cloud.ply>")
-        feat = sonata_features(verts, vcolor, vnormal, args.feat_dim)
+        feat = sonata_features(verts, vcolor, vnormal, args.feat_dim,
+                               grid_size=args.grid_size)
 
     norm = np.linalg.norm(feat, axis=1, keepdims=True)
     return feat / np.clip(norm, 1e-9, None)
@@ -394,6 +400,12 @@ def main():
                     help="use vertex normals as a stand-in feature (no GPU)")
     ap.add_argument("--feat-dim", type=int, default=32,
                     help="PCA dim of the Sonata feature (default 32)")
+    ap.add_argument("--grid-size", type=float, default=None,
+                    help="Sonata internal GridSample size (m). Default 0.02; "
+                         "set ~ your QEM voxel size for sparse LiDAR vertices")
+    ap.add_argument("--save-features", default=None,
+                    help="cache the computed per-vertex features to this .npy "
+                         "(reuse later with --features to skip re-inference)")
     ap.add_argument("--knn", type=int, default=16,
                     help="kNN for base meshing if input has no faces")
     ap.add_argument("--max-hole-edges", type=int, default=80,
@@ -445,6 +457,9 @@ def main():
     # ---- features ----
     print("Attaching per-vertex features ...")
     feat = attach_features(verts, vcolor, vnormal, args)
+    if args.save_features:
+        np.save(args.save_features, feat.astype(np.float32))
+        print(f"  cached per-vertex features -> {args.save_features}")
 
     # ---- gradient calibration ----
     sigma_f = calibrate_sigma_f(faces, feat)
