@@ -135,6 +135,17 @@ def sonata_features(coord, color, normal, feat_dim, grid_size=None, device=None)
         return feat.cpu().numpy().astype(np.float32)
 
 
+def pick_color(file_colors, coord, mode):
+    """Color channel fed to Sonata (0-255). 'zero' matches Sonata's
+    RandomColorDrop pretraining and is the right choice when RGB is
+    absent/dummy; 'auto' uses the file's RGB (in 0-1) if present; 'gray'=128."""
+    if mode == "auto" and file_colors is not None:
+        return (np.asarray(file_colors) * 255.0).astype(np.float32)
+    if mode == "gray":
+        return np.full_like(coord, 128.0)
+    return np.zeros_like(coord)              # 'zero' (default, in-distribution)
+
+
 def attach_features(verts, vcolor, vnormal, args):
     """Return (N, D) L2-normalised per-vertex features for the mesh vertices."""
     if args.features:
@@ -151,8 +162,8 @@ def attach_features(verts, vcolor, vnormal, args):
         print(f"  computing Sonata features on dense cloud: {args.dense}")
         dpcd = o3d.io.read_point_cloud(args.dense)
         dcoord = np.asarray(dpcd.points, np.float32)
-        dcolor = (np.asarray(dpcd.colors) * 255.0 if dpcd.has_colors()
-                  else np.full_like(dcoord, 128.0))
+        dcolor = pick_color(np.asarray(dpcd.colors) if dpcd.has_colors() else None,
+                            dcoord, args.color)
         if dpcd.has_normals():
             dnormal = np.asarray(dpcd.normals)
         else:
@@ -519,6 +530,11 @@ def main():
                          "and exit")
     ap.add_argument("--feat-dim", type=int, default=32,
                     help="PCA dim of the Sonata feature (default 32)")
+    ap.add_argument("--color", choices=["zero", "auto", "gray"], default="zero",
+                    help="color channel fed to Sonata. 'zero' (default) matches "
+                         "Sonata's RandomColorDrop pretraining -> use it for "
+                         "colorless/dummy-RGB LiDAR (points+normals only). "
+                         "'auto' uses the file's RGB; 'gray'=128.")
     ap.add_argument("--grid-size", type=float, default=None,
                     help="Sonata internal GridSample size (m). Default 0.02; "
                          "set ~ your QEM voxel size for sparse LiDAR vertices")
@@ -604,8 +620,9 @@ def main():
 
     mesh.compute_vertex_normals()
     vnormal = np.asarray(mesh.vertex_normals)
-    vcolor = (np.asarray(mesh.vertex_colors) * 255.0
-              if mesh.has_vertex_colors() else np.full_like(verts, 128.0))
+    vcolor = pick_color(
+        np.asarray(mesh.vertex_colors) if mesh.has_vertex_colors() else None,
+        verts, args.color)
 
     # ---- features ----
     print("Attaching per-vertex features ...")
