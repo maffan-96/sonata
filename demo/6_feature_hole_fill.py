@@ -253,8 +253,8 @@ def point_in_polygon(pts, poly):
 def loop_is_fillable(loop, verts, feat, sigma_f, med_edge, args):
     """Geometry + feature-coherence gate. Returns (ok, plane_basis)."""
     P = verts[loop]
-    # size cap
-    if len(loop) > args.max_hole_edges:
+    # size band: skip micro-gaps (DC artifacts) and oversized openings
+    if len(loop) < args.min_hole_edges or len(loop) > args.max_hole_edges:
         return False, None
     diam = np.linalg.norm(P.max(0) - P.min(0))
     if diam > args.max_hole_diam_vox * med_edge:
@@ -351,6 +351,7 @@ def fill_loop(loop, verts, feat, basis, sigma_f, med_edge):
     for a, b in edges:
         wij = np.exp(-(np.linalg.norm(Fall[a] - Fall[b]) ** 2) /
                      (2.0 * sigma_f * sigma_f + 1e-12))
+        wij = max(wij, 1e-3)            # floor keeps the patch graph connected
         rows += [a, b]; cols += [b, a]; vals += [-wij, -wij]
         deg[a] += wij; deg[b] += wij
     rows += list(range(nV)); cols += list(range(nV)); vals += list(deg)
@@ -365,8 +366,18 @@ def fill_loop(loop, verts, feat, basis, sigma_f, med_edge):
         B = np.arange(0, nB)
         L_II = L[I][:, I]
         L_IB = L[I][:, B]
-        hI = spsolve(L_II.tocsc(), -(L_IB @ hB))
-        hI = np.atleast_1d(np.asarray(hI))
+        # Tikhonov regularisation toward the plane (h=0): keeps the system SPD
+        # even when conductances underflow / the interior is disconnected, and
+        # biases ambiguous fills to the best-fit plane instead of exploding.
+        from scipy.sparse import eye as _sp_eye
+        A = (L_II + 1e-6 * _sp_eye(L_II.shape[0])).tocsc()
+        try:
+            hI = spsolve(A, -(L_IB @ hB))
+        except Exception:
+            return _empty()
+        hI = np.atleast_1d(np.asarray(hI, dtype=float))
+        if not np.all(np.isfinite(hI)):
+            return _empty()                 # skip rather than emit garbage
         new_uv = uv[nB:]
         new_xyz = c + np.outer(new_uv[:, 0], u) + np.outer(new_uv[:, 1], v) \
             + np.outer(hI, n)
@@ -408,6 +419,9 @@ def main():
                          "(reuse later with --features to skip re-inference)")
     ap.add_argument("--knn", type=int, default=16,
                     help="kNN for base meshing if input has no faces")
+    ap.add_argument("--min-hole-edges", type=int, default=6,
+                    help="skip boundary loops shorter than this (dual-contouring "
+                         "micro-gaps / non-manifold nicks, not real holes)")
     ap.add_argument("--max-hole-edges", type=int, default=80,
                     help="skip boundary loops longer than this")
     ap.add_argument("--max-hole-diam-vox", type=float, default=10.0,
@@ -469,6 +483,13 @@ def main():
             edge_lens.append(np.linalg.norm(verts[a] - verts[b]))
     med_edge = float(np.median(edge_lens)) if edge_lens else 0.05
     print(f"  sigma_f = {sigma_f:.4f}   median edge = {med_edge:.4f} m")
+    if sigma_f <= 2e-3:
+        print("  [WARN] sigma_f is ~0 -> per-vertex features are nearly constant. "
+              "The feature gradient carries little signal (you will see grid/"
+              "serialization 'box' artifacts, not semantic boundaries). This is "
+              "expected when running on DECIMATED, COLORLESS vertices. Use "
+              "--dense <raw_lidar.ply> (with intensity in the color channel) for "
+              "meaningful features.")
 
     # ---- boundary loops ----
     loops = boundary_loops(faces)
