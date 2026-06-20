@@ -175,6 +175,106 @@ def attach_features(verts, vcolor, vnormal, args):
 
 
 # --------------------------------------------------------------------------- #
+# ASCII-PLY scalar-field reader  (for QEM per-vertex descriptors as features)
+# --------------------------------------------------------------------------- #
+def parse_ascii_ply(path):
+    """Minimal ASCII-PLY parser that keeps ALL vertex scalar properties (which
+    open3d drops). Returns dict: verts (N,3), normals (N,3) or None, colors or
+    None, faces (M,3), props {name: (N,) float}. Binary PLY is not supported
+    here -- use --dense / open3d path or convert to ASCII."""
+    with open(path, "r", errors="replace") as f:
+        if f.readline().strip() != "ply":
+            raise ValueError("not a PLY file")
+        fmt = ""
+        elements = []          # list of (name, count, [prop_names], is_face)
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError("unexpected EOF in header")
+            tok = line.split()
+            if not tok:
+                continue
+            if tok[0] == "format":
+                fmt = tok[1]
+            elif tok[0] == "element":
+                elements.append([tok[1], int(tok[2]), [], False])
+            elif tok[0] == "property":
+                if tok[1] == "list":
+                    elements[-1][3] = True          # face list
+                else:
+                    elements[-1][2].append(tok[-1])
+            elif tok[0] == "end_header":
+                break
+        if not fmt.startswith("ascii"):
+            raise ValueError(
+                f"PLY is '{fmt}', not ascii. Re-export as ascii (or pass the "
+                "_meta.csv via --meta-csv) to read scalar fields.")
+
+        verts, normals, colors, faces, props = None, None, None, [], {}
+        for name, count, pnames, is_face in elements:
+            if is_face:
+                for _ in range(count):
+                    t = f.readline().split()
+                    k = int(t[0])
+                    idx = list(map(int, t[1:1 + k]))
+                    for j in range(1, k - 1):       # fan-triangulate polygons
+                        faces.append([idx[0], idx[j], idx[j + 1]])
+                continue
+            cols = {p: np.empty(count, np.float64) for p in pnames}
+            data = np.empty((count, len(pnames)), np.float64)
+            for r in range(count):
+                data[r] = np.asarray(f.readline().split()[:len(pnames)], float)
+            for ci, p in enumerate(pnames):
+                cols[p] = data[:, ci]
+            if name == "vertex":
+                verts = np.stack([cols[k] for k in ("x", "y", "z")], 1)
+                if all(k in cols for k in ("nx", "ny", "nz")):
+                    normals = np.stack([cols[k] for k in ("nx", "ny", "nz")], 1)
+                if all(k in cols for k in ("red", "green", "blue")):
+                    colors = np.stack([cols[k] for k in
+                                       ("red", "green", "blue")], 1)
+                props = cols
+    return dict(verts=verts, normals=normals, colors=colors,
+                faces=np.asarray(faces, np.int64), props=props)
+
+
+# default per-vertex descriptor for colorless LiDAR: geometry + evidence.
+# normals are included implicitly (added by the caller); these are the scalar
+# fields that best separate "same surface" from "real boundary".
+DEFAULT_FIELD_CANDIDATES = (
+    "normal_consistency", "residual",
+    "lambda2_over_lambda1", "lambda3_over_lambda1",
+    "eogm_bel_surface", "eogm_bel_free",
+)
+
+
+def build_field_features(props, normals, field_names):
+    """Assemble a per-vertex feature matrix from selected scalar fields
+    (z-scored) plus the unit normal, then L2-normalise per vertex. The gradient
+    of THIS is a physical geometric/evidential boundary detector -- no Sonata,
+    no color needed."""
+    cols = []
+    used = []
+    if normals is not None:
+        cols.append(normals)                       # direction, kept raw
+        used.append("nx,ny,nz")
+    for name in field_names:
+        if name not in props:
+            print(f"  [skip] field '{name}' not in PLY")
+            continue
+        v = props[name].astype(np.float64)
+        std = v.std()
+        cols.append(((v - v.mean()) / std if std > 1e-12 else v * 0.0)[:, None])
+        used.append(name)
+    if not cols:
+        raise SystemExit("no usable feature fields found in the PLY")
+    print(f"  feature fields: {', '.join(used)}")
+    feat = np.concatenate(cols, axis=1).astype(np.float32)
+    norm = np.linalg.norm(feat, axis=1, keepdims=True)
+    return feat / np.clip(norm, 1e-9, None)
+
+
+# --------------------------------------------------------------------------- #
 # Mesh helpers
 # --------------------------------------------------------------------------- #
 def edge_face_counts(faces):
@@ -409,6 +509,14 @@ def main():
                     help="precomputed per-vertex features .npy (N x D)")
     ap.add_argument("--no-sonata", action="store_true",
                     help="use vertex normals as a stand-in feature (no GPU)")
+    ap.add_argument("--feature-fields", default=None,
+                    help="comma-list of ASCII-PLY scalar fields to use as the "
+                         "per-vertex feature instead of Sonata (e.g. the QEM "
+                         "descriptors). Pass 'auto' for a sensible default set. "
+                         "Best choice for colorless LiDAR meshes.")
+    ap.add_argument("--list-fields", action="store_true",
+                    help="print the scalar fields available in the input PLY "
+                         "and exit")
     ap.add_argument("--feat-dim", type=int, default=32,
                     help="PCA dim of the Sonata feature (default 32)")
     ap.add_argument("--grid-size", type=float, default=None,
@@ -438,6 +546,37 @@ def main():
         raise SystemExit("open3d is required for mesh I/O: pip install open3d")
 
     out_ply = args.output or (os.path.splitext(args.input)[0] + "_filled.ply")
+
+    use_fields = bool(args.feature_fields) or args.list_fields
+
+    # ---- field path: parse the ASCII PLY ourselves to keep scalar fields ----
+    if use_fields:
+        print(f"Loading (with scalar fields): {args.input}")
+        ply = parse_ascii_ply(args.input)
+        if args.list_fields:
+            print("Available vertex scalar fields:")
+            for k in ply["props"]:
+                print(f"  {k}")
+            return
+        verts = ply["verts"].astype(np.float32)
+        faces = ply["faces"]
+        vnormal = ply["normals"]
+        if vnormal is None:
+            tmp = o3d.geometry.TriangleMesh()
+            tmp.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
+            tmp.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+            tmp.compute_vertex_normals()
+            vnormal = np.asarray(tmp.vertex_normals)
+        if verts.shape[0] == 0 or faces.shape[0] == 0:
+            raise SystemExit("field path needs a mesh with vertices and faces")
+        fields = (list(DEFAULT_FIELD_CANDIDATES) if args.feature_fields == "auto"
+                  else [s.strip() for s in args.feature_fields.split(",")])
+        print("Building per-vertex features from QEM scalar fields ...")
+        feat = build_field_features(ply["props"], vnormal, fields)
+        if args.save_features:
+            np.save(args.save_features, feat.astype(np.float32))
+            print(f"  cached per-vertex features -> {args.save_features}")
+        return _run_fill(verts, faces, vnormal, feat, out_ply, args)
 
     # ---- load ----
     print(f"Loading: {args.input}")
@@ -475,6 +614,10 @@ def main():
         np.save(args.save_features, feat.astype(np.float32))
         print(f"  cached per-vertex features -> {args.save_features}")
 
+    return _run_fill(verts, faces, vnormal, feat, out_ply, args)
+
+
+def _run_fill(verts, faces, vnormal, feat, out_ply, args):
     # ---- gradient calibration ----
     sigma_f = calibrate_sigma_f(faces, feat)
     edge_lens = []
@@ -484,12 +627,11 @@ def main():
     med_edge = float(np.median(edge_lens)) if edge_lens else 0.05
     print(f"  sigma_f = {sigma_f:.4f}   median edge = {med_edge:.4f} m")
     if sigma_f <= 2e-3:
-        print("  [WARN] sigma_f is ~0 -> per-vertex features are nearly constant. "
-              "The feature gradient carries little signal (you will see grid/"
-              "serialization 'box' artifacts, not semantic boundaries). This is "
-              "expected when running on DECIMATED, COLORLESS vertices. Use "
-              "--dense <raw_lidar.ply> (with intensity in the color channel) for "
-              "meaningful features.")
+        print("  [WARN] sigma_f is ~0 -> per-vertex features are nearly constant, "
+              "so the gradient carries little signal (expect grid/serialization "
+              "'box' artifacts, not real boundaries). For Sonata features this "
+              "means decimated/colorless input -> use --dense; otherwise pick "
+              "more discriminative --feature-fields.")
 
     # ---- boundary loops ----
     loops = boundary_loops(faces)
